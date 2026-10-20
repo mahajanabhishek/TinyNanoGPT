@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "model.h"
 #include <iostream>
 #include <fstream>
@@ -8,6 +9,11 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <cstdio>
+#include <omp.h> // Required for OpenMP multithreading
+
+// Set to false to disable the progress bar (e.g., when logging to a file)
+static bool gpt_show_progress = true;
 
 // Simple structure for loss logging
 struct LossLog {
@@ -56,24 +62,6 @@ float get_lr(int step, int warmup_steps, int max_steps, float max_lr, float min_
     return min_lr + 0.5f * (max_lr - min_lr) * (1.0f + std::cos(M_PI * progress));
 }
 
-// Simple progress bar
-void print_progress(int step, int max_steps, float loss, float lr, const std::string& prefix = "") {
-    int bar_width = 30;
-    float progress = static_cast<float>(step) / max_steps;
-    int pos = static_cast<int>(bar_width * progress);
-    
-    std::cout << "\r" << prefix << " [";
-    for (int i = 0; i < bar_width; i++) {
-        if (i < pos) std::cout << "=";
-        else if (i == pos) std::cout << ">";
-        else std::cout << " ";
-    }
-    std::cout << "] " << std::setw(3) << static_cast<int>(progress * 100.0f) << "% "
-              << "loss: " << std::fixed << std::setprecision(4) << loss
-              << " lr: " << std::scientific << lr;
-    std::cout.flush();
-}
-
 // Generate text from model
 std::string generate(
     GPT& model,
@@ -100,9 +88,6 @@ std::string generate(
     if (tokens.empty()) {
         return prompt; // Return original prompt if no valid tokens
     }
-    
-    // Set model to eval mode (no dropout in our implementation, but keep for consistency)
-    // In our case, we just use the model as-is
     
     std::vector<int> gen_tokens = tokens;
     int block_size = model.config.block_size;
@@ -366,6 +351,11 @@ int main(int argc, char* argv[]) {
             n_embd = std::stoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             seed = std::stoi(argv[++i]);
+        } else if (arg == "--log-level" && i + 1 < argc) {
+            int level = std::stoi(argv[++i]);
+            gpt::log::set_level(level);
+        } else if (arg == "--no-progress") {
+            gpt_show_progress = false;
         }
     }
     
@@ -431,7 +421,12 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Starting training for " << max_steps << " steps..." << std::endl;
     
+    // Initialize the Progress Bar from logging.h
+    gpt::ProgressBar progress_bar(max_steps, "Training", gpt_show_progress);
+    
     for (int step = 0; step < max_steps; step++) {
+        auto step_start = std::chrono::steady_clock::now();
+        
         // Get batch
         auto batch = utils::get_batch(tokens, block_size, batch_size, token_idx);
         std::vector<int>& x_flat = batch.first;
@@ -443,9 +438,11 @@ int main(int argc, char* argv[]) {
             token_idx = 0;  // Reset to beginning
         }
         
-        // Convert to tensors
+        // Convert to tensors (MULTITHREADED)
         Tensor x({batch_size, block_size});
         Tensor y({batch_size, block_size});
+        
+        #pragma omp parallel for
         for (int i = 0; i < batch_size * block_size; i++) {
             x.data[i] = static_cast<float>(x_flat[i]);
             y.data[i] = static_cast<float>(y_flat[i]);
@@ -455,40 +452,45 @@ int main(int argc, char* argv[]) {
         auto result = model.forward(x, &y);
         float loss = result.second;
         
-        // Backward pass would go here - but we haven't implemented autograd
-        // For now, we'll skip the backward pass and just use random gradients
-        // In a real implementation, we would compute gradients via backprop
-        
-        // Dummy gradients for demonstration (in practice, these would come from backprop)
-        std::vector<Tensor> grads;
-        std::default_random_engine generator;
-        std::normal_distribution<float> distribution(0.0f, 0.01f);
-        for (const Tensor& param : params) {
-            Tensor grad(param.dims);
-            for (size_t i = 0; i < param.data.size(); i++) {
-                grad.data[i] = distribution(generator);
+        // Dummy gradients for demonstration (MULTITHREADED with thread-safe RNG)
+        std::vector<Tensor> grads(params.size());
+        #pragma omp parallel
+        {
+            // Each thread gets its own random number generator to avoid race conditions
+            std::default_random_engine generator(omp_get_thread_num() + seed + step);
+            std::normal_distribution<float> distribution(0.0f, 0.01f);
+            
+            #pragma omp for
+            for (size_t p = 0; p < params.size(); p++) {
+                grads[p] = Tensor(params[p].dims);
+                for (size_t i = 0; i < params[p].data.size(); i++) {
+                    grads[p].data[i] = distribution(generator);
+                }
             }
-            grads.push_back(grad);
         }
         
         // Update learning rate
         float lr = get_lr(step, warmup_steps, max_steps, learning_rate, learning_rate * 0.1f);
         optimizer.learning_rate = lr;
         
-        // Clip gradients (simplified)
+        // Clip gradients (MULTITHREADED)
         float max_norm = 1.0f;
         float total_norm = 0.0f;
-        for (const Tensor& grad : grads) {
-            for (float g : grad.data) {
-                total_norm += g * g;
+        
+        #pragma omp parallel for reduction(+:total_norm)
+        for (size_t p = 0; p < grads.size(); p++) {
+            for (size_t i = 0; i < grads[p].data.size(); i++) {
+                total_norm += grads[p].data[i] * grads[p].data[i];
             }
         }
+        
         total_norm = std::sqrt(total_norm);
         float clip_coef = max_norm / (total_norm + 1e-6f);
         if (clip_coef < 1.0f) {
-            for (Tensor& grad : grads) {
-                for (float& g : grad.data) {
-                    g *= clip_coef;
+            #pragma omp parallel for
+            for (size_t p = 0; p < grads.size(); p++) {
+                for (size_t i = 0; i < grads[p].data.size(); i++) {
+                    grads[p].data[i] *= clip_coef;
                 }
             }
         }
@@ -496,22 +498,32 @@ int main(int argc, char* argv[]) {
         // Optimizer step
         optimizer.step(params, grads);
         
-        // Logging
+        // --- PROGRESS BAR & LOGGING ---
+        auto step_end = std::chrono::steady_clock::now();
+        double step_time = std::chrono::duration<double>(step_end - step_start).count();
+        
+        // Format the suffix for the progress bar
+        char suffix_buf[128];
+        std::snprintf(suffix_buf, sizeof(suffix_buf), "loss: %.4f  lr: %.2e  %.2fs/step", loss, lr, step_time);
+        progress_bar.update(step + 1, suffix_buf);
+        
+        // Detailed Logging & Sampling (every 100 steps)
         if (step % 100 == 0) {
-            // Validation (simplified - just use training loss for now)
-            float val_loss = loss;  // In practice, we'd compute on validation set
+            // Print a newline so we don't overwrite the progress bar messily
+            if (gpt_show_progress && gpt::log::stdout_is_tty()) std::cout << std::endl;
             
+            // Validation (simplified - just use training loss for now)
+            float val_loss = loss;  
             loss_log.add(step, loss, val_loss);
-            print_progress(step, max_steps, loss, lr, "Training");
-            std::cout << " | val loss: " << std::fixed << std::setprecision(4) << val_loss;
+            
+            std::cout << "[Step " << step << "] Detailed Metrics -> val loss: " 
+                      << std::fixed << std::setprecision(4) << val_loss << "\n";
             
             // Generate sample
             if (step > 0) {
-                // In our simple model, we don't have train/eval modes, so just use it directly
                 std::string sample = generate(model, "To be or not", stoi, itos, 100, 0.8f, 40, seed + step);
                 std::cout << "\n--- Sample ---\n" << sample << "\n--- End sample ---\n";
             }
-            std::cout << std::endl;
         }
         
         // Save checkpoint
@@ -520,6 +532,8 @@ int main(int argc, char* argv[]) {
             save_checkpoint(model, optimizer, step, stoi, itos, checkpoint_file);
         }
     }
+    
+    progress_bar.finish("Training completed!");
     
     // Save final checkpoint
     std::string final_checkpoint = checkpoint_dir + "checkpoint_final.bin";
