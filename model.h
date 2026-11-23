@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <numeric>
 #include <cassert>
+#include <limits>
+#include <utility>
 
 // Simple tensor class for float data
 class Tensor {
@@ -249,7 +251,7 @@ Tensor transpose_last_two(const Tensor& a) {
 }
 
 // Layer normalization: normalize over last dimension
-Tensor layer_norm(const Tensor& x, float eps = 1e-5f) {
+Tensor layer_norm(const Tensor& x, float eps = 1e-5f, std::vector<float>* inverse_std = nullptr) {
     assert(x.dims.size() >= 2);
     int64_t last_dim = x.dims.back();
     int64_t outer_size = 1;
@@ -257,6 +259,7 @@ Tensor layer_norm(const Tensor& x, float eps = 1e-5f) {
         outer_size *= x.dims[i];
     }
     
+    if (inverse_std) inverse_std->resize(outer_size);
     Tensor y(x.dims);
     for (int64_t i = 0; i < outer_size; i++) {
         float mean = 0.0f;
@@ -274,6 +277,7 @@ Tensor layer_norm(const Tensor& x, float eps = 1e-5f) {
         }
         variance /= last_dim;
         float inv_std = 1.0f / std::sqrt(variance + eps);
+        if (inverse_std) (*inverse_std)[i] = inv_std;
         
         for (int64_t j = 0; j < last_dim; j++) {
             int64_t idx = i * last_dim + j;
@@ -402,382 +406,383 @@ struct GPTConfig {
     int n_embd = 384;          // embedding dimension
 };
 
-// Causal self-attention module
+using Gradients = std::unordered_map<const Tensor*, Tensor>;
+
+inline Tensor& gradient_for(Gradients& gradients, const Tensor& parameter) {
+    return gradients.try_emplace(&parameter, parameter.dims).first->second;
+}
+
+namespace ops {
+
+inline Tensor transpose2d(const Tensor& input) {
+    const auto rows = input.dims[0], cols = input.dims[1];
+    Tensor output({cols, rows});
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < cols; ++col) {
+            output.data[col * rows + row] = input.data[row * cols + col];
+        }
+    }
+    return output;
+}
+
+inline Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
+    return add(matmul(input, weight), bias);
+}
+
+inline Tensor linear_backward(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                              const Tensor& upstream, Gradients& gradients) {
+    gradient_for(gradients, weight) = matmul(transpose2d(input), upstream);
+    Tensor& bias_gradient = gradient_for(gradients, bias);
+    const auto cols = bias.dims[0];
+    for (size_t i = 0; i < upstream.data.size(); ++i) {
+        bias_gradient.data[i % cols] += upstream.data[i];
+    }
+    return matmul(upstream, transpose2d(weight));
+}
+
+struct LayerNormCache {
+    Tensor normalized;
+    std::vector<float> inverse_std;
+};
+
+inline Tensor affine_layer_norm(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                LayerNormCache* cache) {
+    Tensor normalized = layer_norm(input, 1e-5f, cache ? &cache->inverse_std : nullptr);
+    Tensor output(input.dims);
+    const auto cols = weight.dims[0];
+    for (size_t i = 0; i < output.data.size(); ++i) {
+        output.data[i] = normalized.data[i] * weight.data[i % cols] + bias.data[i % cols];
+    }
+    if (cache) cache->normalized = std::move(normalized);
+    return output;
+}
+
+inline Tensor layer_norm_backward(const LayerNormCache& cache, const Tensor& weight, const Tensor& bias,
+                                  const Tensor& upstream, Gradients& gradients) {
+    Tensor& weight_gradient = gradient_for(gradients, weight);
+    Tensor& bias_gradient = gradient_for(gradients, bias);
+    Tensor input_gradient(upstream.dims);
+    const auto cols = weight.dims[0];
+    for (size_t row = 0; row < cache.inverse_std.size(); ++row) {
+        float sum = 0.0f, normalized_sum = 0.0f;
+        for (int64_t col = 0; col < cols; ++col) {
+            const auto i = row * cols + col;
+            const float scaled = upstream.data[i] * weight.data[col];
+            sum += scaled;
+            normalized_sum += scaled * cache.normalized.data[i];
+            weight_gradient.data[col] += upstream.data[i] * cache.normalized.data[i];
+            bias_gradient.data[col] += upstream.data[i];
+        }
+        for (int64_t col = 0; col < cols; ++col) {
+            const auto i = row * cols + col;
+            input_gradient.data[i] = cache.inverse_std[row] *
+                (upstream.data[i] * weight.data[col] -
+                 (sum + cache.normalized.data[i] * normalized_sum) / cols);
+        }
+    }
+    return input_gradient;
+}
+
+} // namespace ops
+
 class CausalSelfAttention {
 public:
-    Tensor c_attn_weight;  // [n_embd, 3 * n_embd]
-    Tensor c_attn_bias;    // [3 * n_embd]
-    Tensor c_proj_weight;  // [n_embd, n_embd]
-    Tensor c_proj_bias;    // [n_embd]
-    
-    int n_head;
-    int n_embd;
-    
-    CausalSelfAttention(int n_embd, int n_head) : n_embd(n_embd), n_head(n_head) {
-        // Initialize weights
-        c_attn_weight = Tensor({n_embd, 3 * n_embd});
-        c_attn_weight.randn(0.0f, 0.02f);
-        c_attn_bias = Tensor({3 * n_embd});
-        c_attn_bias.fill(0.0f);
-        
-        c_proj_weight = Tensor({n_embd, n_embd});
-        c_proj_weight.randn(0.0f, 0.02f);
-        c_proj_bias = Tensor({n_embd});
-        c_proj_bias.fill(0.0f);
+    struct Cache {
+        Tensor input;
+        Tensor qkv;
+        Tensor probabilities;
+        Tensor context;
+    };
+
+    Tensor c_attn_weight, c_attn_bias, c_proj_weight, c_proj_bias;
+    int n_head, n_embd;
+
+    CausalSelfAttention(int n_embd, int n_head)
+        : c_attn_weight({n_embd, 3 * n_embd}), c_attn_bias({3 * n_embd}),
+          c_proj_weight({n_embd, n_embd}), c_proj_bias({n_embd}),
+          n_head(n_head), n_embd(n_embd) {
+        c_attn_weight.randn();
+        c_proj_weight.randn();
     }
-    
-    // Forward pass
-    Tensor forward(const Tensor& x) {
-        // x: [B, T, C]
-        int64_t B = x.dims[0];
-        int64_t T = x.dims[1];
-        int64_t C = x.dims[2];
-        assert(C == n_embd);
-        
-        // Reshape to [B*T, C] for efficiency
-        Tensor x_flat({B * T, C});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < C; j++) {
-                x_flat.data[i * C + j] = x.data[i * C + j];
-            }
-        }
-        
-        // QKV projection: [B*T, C] * [C, 3*C] -> [B*T, 3*C]
-        Tensor qkv = ops::matmul(x_flat, c_attn_weight);
-        qkv = ops::add(qkv, c_attn_bias);  // [B*T, 3*C]
-        
-        // Split into Q, K, V: each [B*T, C]
-        Tensor Q({B * T, C});
-        Tensor K({B * T, C});
-        Tensor V({B * T, C});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < C; j++) {
-                Q.data[i * C + j] = qkv.data[i * 3 * C + j];
-                K.data[i * C + j] = qkv.data[i * 3 * C + C + j];
-                V.data[i * C + j] = qkv.data[i * 3 * C + 2 * C + j];
-            }
-        }
-        
-        // Reshape for multi-head: [B*T, C] -> [B*T, n_head, head_dim]
-        int64_t head_dim = C / n_head;
-        Tensor Q_reshaped({B * T, n_head, head_dim});
-        Tensor K_reshaped({B * T, n_head, head_dim});
-        Tensor V_reshaped({B * T, n_head, head_dim});
-        
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t h = 0; h < n_head; h++) {
-                for (int64_t d = 0; d < head_dim; d++) {
-                    int64_t src_idx = i * C + h * head_dim + d;
-                    int64_t dst_idx = i * n_head * head_dim + h * head_dim + d;
-                    Q_reshaped.data[dst_idx] = Q.data[src_idx];
-                    K_reshaped.data[dst_idx] = K.data[src_idx];
-                    V_reshaped.data[dst_idx] = V.data[src_idx];
-                }
-            }
-        }
-        
-        // Transpose to [B*T, n_head, head_dim] -> [n_head, B*T, head_dim] for batch matrix multiplication
-        // We'll compute attention per head
-        Tensor attn_output({B * T, C});
-        
-        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        
-        for (int64_t h = 0; h < n_head; h++) {
-            // Extract head h: [B*T, head_dim]
-            Tensor Q_h({B * T, head_dim});
-            Tensor K_h({B * T, head_dim});
-            Tensor V_h({B * T, head_dim});
-            
-            for (int64_t i = 0; i < B * T; i++) {
-                for (int64_t d = 0; d < head_dim; d++) {
-                    int64_t src_idx = i * n_head * head_dim + h * head_dim + d;
-                    Q_h.data[i * head_dim + d] = Q_reshaped.data[src_idx];
-                    K_h.data[i * head_dim + d] = K_reshaped.data[src_idx];
-                    V_h.data[i * head_dim + d] = V_reshaped.data[src_idx];
-                }
-            }
-            
-            // Actually, let's implement a proper transpose for 2D: [M, N] -> [N, M]
-            auto transpose2d = [](const Tensor& t) {
-                assert(t.dims.size() == 2);
-                Tensor result({t.dims[1], t.dims[0]});
-                for (int64_t i = 0; i < t.dims[0]; i++) {
-                    for (int64_t j = 0; j < t.dims[1]; j++) {
-                        result.data[j * t.dims[0] + i] = t.data[i * t.dims[1] + j];
+
+    Tensor forward(const Tensor& input, int64_t batch, int64_t time, Cache* cache) const {
+        const int64_t channels = n_embd, head_size = channels / n_head;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+        Tensor qkv = ops::linear(input, c_attn_weight, c_attn_bias);
+        Tensor context({batch * time, channels});
+        Tensor probabilities;
+        if (cache) probabilities = Tensor({batch, n_head, time, time});
+        std::vector<float> row(time);
+
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t h = 0; h < n_head; ++h) {
+                const auto head = h * head_size;
+                for (int64_t t = 0; t < time; ++t) {
+                    const auto query = (b * time + t) * 3 * channels + head;
+                    float max_score = -std::numeric_limits<float>::infinity();
+                    for (int64_t s = 0; s <= t; ++s) {
+                        const auto key = (b * time + s) * 3 * channels + channels + head;
+                        float score = 0.0f;
+                        for (int64_t d = 0; d < head_size; ++d) {
+                            score += qkv.data[query + d] * qkv.data[key + d];
+                        }
+                        row[s] = score * scale;
+                        max_score = std::max(max_score, row[s]);
                     }
-                }
-                return result;
-            };
-            
-            Tensor K_h_T2 = transpose2d(K_h); // [head_dim, B*T]
-            Tensor scores = ops::matmul(Q_h, K_h_T2); // [B*T, B*T]
-            
-            // Scale scores
-            scores = ops::mul_scalar(scores, scale);
-            
-            // Apply causal mask: mask out future tokens
-            for (int64_t i = 0; i < B * T; i++) {
-                for (int64_t j = 0; j < B * T; j++) {
-                    if (j > i) { // future token
-                        scores.data[i * (B * T) + j] = -1e9f; // large negative
+
+                    float sum = 0.0f;
+                    for (int64_t s = 0; s <= t; ++s) {
+                        row[s] = std::exp(row[s] - max_score);
+                        sum += row[s];
+                    }
+                    const auto out = (b * time + t) * channels + head;
+                    const auto probability_row = ((b * n_head + h) * time + t) * time;
+                    for (int64_t s = 0; s <= t; ++s) {
+                        const float probability = row[s] / sum;
+                        if (cache) probabilities.data[probability_row + s] = probability;
+                        const auto value = (b * time + s) * 3 * channels + 2 * channels + head;
+                        for (int64_t d = 0; d < head_size; ++d) {
+                            context.data[out + d] += probability * qkv.data[value + d];
+                        }
                     }
                 }
             }
-            
-            // Softmax
-            Tensor attn_weights = ops::softmax(scores); // [B*T, B*T]
-            
-            // Apply attention to V: attn_weights * V -> [B*T, head_dim]
-            Tensor attn_h = ops::matmul(attn_weights, V_h); // [B*T, head_dim]
-            
-            // Store in output
-            for (int64_t i = 0; i < B * T; i++) {
-                for (int64_t d = 0; d < head_dim; d++) {
-                    int64_t dst_idx = i * n_head * head_dim + h * head_dim + d;
-                    attn_output.data[dst_idx] = attn_h.data[i * head_dim + d];
-                }
-            }
         }
-        
-        // Output projection: [B*T, C] * [C, C] -> [B*T, C]
-        Tensor proj_output = ops::matmul(attn_output, c_proj_weight);
-        proj_output = ops::add(proj_output, c_proj_bias); // [B*T, C]
-        
-        // Reshape back to [B, T, C]
-        Tensor output({B, T, C});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < C; j++) {
-                output.data[i * C + j] = proj_output.data[i * C + j];
-            }
-        }
-        
+        Tensor output = ops::linear(context, c_proj_weight, c_proj_bias);
+        if (cache) *cache = {input, std::move(qkv), std::move(probabilities), std::move(context)};
         return output;
+    }
+
+    Tensor backward(const Cache& cache, const Tensor& upstream, Gradients& gradients) const {
+        const auto batch = cache.probabilities.dims[0], time = cache.probabilities.dims[2];
+        const int64_t channels = n_embd, head_size = channels / n_head;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+        Tensor context_gradient = ops::linear_backward(cache.context, c_proj_weight, c_proj_bias,
+                                                       upstream, gradients);
+        Tensor qkv_gradient(cache.qkv.dims);
+        std::vector<float> value_dots(time);
+
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t h = 0; h < n_head; ++h) {
+                const auto head = h * head_size;
+                for (int64_t t = 0; t < time; ++t) {
+                    const auto out = (b * time + t) * channels + head;
+                    const auto query = (b * time + t) * 3 * channels + head;
+                    const auto probability_row = ((b * n_head + h) * time + t) * time;
+                    float mean_dot = 0.0f;
+                    for (int64_t s = 0; s <= t; ++s) {
+                        const auto value = (b * time + s) * 3 * channels + 2 * channels + head;
+                        const float probability = cache.probabilities.data[probability_row + s];
+                        float dot = 0.0f;
+                        for (int64_t d = 0; d < head_size; ++d) {
+                            const float delta = context_gradient.data[out + d];
+                            dot += delta * cache.qkv.data[value + d];
+                            qkv_gradient.data[value + d] += probability * delta;
+                        }
+                        value_dots[s] = dot;
+                        mean_dot += probability * dot;
+                    }
+
+                    // Apply the softmax Jacobian to the probability gradients.
+                    for (int64_t s = 0; s <= t; ++s) {
+                        const auto key = (b * time + s) * 3 * channels + channels + head;
+                        const float delta = scale * cache.probabilities.data[probability_row + s] *
+                                            (value_dots[s] - mean_dot);
+                        for (int64_t d = 0; d < head_size; ++d) {
+                            qkv_gradient.data[query + d] += delta * cache.qkv.data[key + d];
+                            qkv_gradient.data[key + d] += delta * cache.qkv.data[query + d];
+                        }
+                    }
+                }
+            }
+        }
+        return ops::linear_backward(cache.input, c_attn_weight, c_attn_bias, qkv_gradient, gradients);
     }
 };
 
-// MLP module
 class MLP {
 public:
-    Tensor c_fc_weight;   // [n_embd, 4 * n_embd]
-    Tensor c_fc_bias;     // [4 * n_embd]
-    Tensor c_proj_weight; // [4 * n_embd, n_embd]
-    Tensor c_proj_bias;   // [n_embd]
-    
-    int n_embd;
-    
-    MLP(int n_embd) : n_embd(n_embd) {
-        // Initialize weights
-        c_fc_weight = Tensor({n_embd, 4 * n_embd});
-        c_fc_weight.randn(0.0f, 0.02f);
-        c_fc_bias = Tensor({4 * n_embd});
-        c_fc_bias.fill(0.0f);
-        
-        c_proj_weight = Tensor({4 * n_embd, n_embd});
-        c_proj_weight.randn(0.0f, 0.02f);
-        c_proj_bias = Tensor({n_embd});
-        c_proj_bias.fill(0.0f);
+    struct Cache {
+        Tensor input;
+        Tensor pre_activation;
+        Tensor activation;
+    };
+
+    Tensor c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias;
+
+    MLP(int channels)
+        : c_fc_weight({channels, 4 * channels}), c_fc_bias({4 * channels}),
+          c_proj_weight({4 * channels, channels}), c_proj_bias({channels}) {
+        c_fc_weight.randn();
+        c_proj_weight.randn();
     }
-    
-    // Forward pass
-    Tensor forward(const Tensor& x) {
-        // x: [B, T, C]
-        int64_t B = x.dims[0];
-        int64_t T = x.dims[1];
-        int64_t C = x.dims[2];
-        assert(C == n_embd);
-        
-        // Reshape to [B*T, C]
-        Tensor x_flat({B * T, C});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < C; j++) {
-                x_flat.data[i * C + j] = x.data[i * C + j];
-            }
-        }
-        
-        // FC layer: [B*T, C] * [C, 4*C] -> [B*T, 4*C]
-        Tensor fc = ops::matmul(x_flat, c_fc_weight);
-        fc = ops::add(fc, c_fc_bias); // [B*T, 4*C]
-        
-        // GELU activation
-        Tensor gelu_out = ops::gelu(fc);
-        
-        // Projection: [B*T, 4*C] * [4*C, C] -> [B*T, C]
-        Tensor proj = ops::matmul(gelu_out, c_proj_weight);
-        proj = ops::add(proj, c_proj_bias); // [B*T, C]
-        
-        // Reshape back to [B, T, C]
-        Tensor output({B, T, C});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < C; j++) {
-                output.data[i * C + j] = proj.data[i * C + j];
-            }
-        }
-        
+
+    Tensor forward(const Tensor& input, Cache* cache) const {
+        Tensor pre_activation = ops::linear(input, c_fc_weight, c_fc_bias);
+        Tensor activation = ops::gelu(pre_activation);
+        Tensor output = ops::linear(activation, c_proj_weight, c_proj_bias);
+        if (cache) *cache = {input, std::move(pre_activation), std::move(activation)};
         return output;
     }
+
+    Tensor backward(const Cache& cache, const Tensor& upstream, Gradients& gradients) const {
+        Tensor delta = ops::linear_backward(cache.activation, c_proj_weight, c_proj_bias,
+                                            upstream, gradients);
+        constexpr float inverse_sqrt_2pi = 0.3989422804f;
+        for (size_t i = 0; i < delta.data.size(); ++i) {
+            const float x = cache.pre_activation.data[i];
+            const float cdf = 0.5f * (1.0f + std::erf(x / std::sqrt(2.0f)));
+            delta.data[i] *= cdf + x * inverse_sqrt_2pi * std::exp(-0.5f * x * x);
+        }
+        return ops::linear_backward(cache.input, c_fc_weight, c_fc_bias, delta, gradients);
+    }
 };
 
-// Transformer block
 class Block {
 public:
-    Tensor ln_1_weight; // [n_embd]
-    Tensor ln_1_bias;   // [n_embd]
+    struct Cache {
+        ops::LayerNormCache ln_1, ln_2;
+        CausalSelfAttention::Cache attention;
+        MLP::Cache mlp;
+    };
+
+    Tensor ln_1_weight, ln_1_bias;
     CausalSelfAttention attn;
-    Tensor ln_2_weight; // [n_embd]
-    Tensor ln_2_bias;   // [n_embd]
+    Tensor ln_2_weight, ln_2_bias;
     MLP mlp;
-    
-    Block(int n_embd, int n_head) 
-        : attn(n_embd, n_head), mlp(n_embd) {
-        // LayerNorm weights
-        ln_1_weight = Tensor({n_embd});
+
+    Block(int channels, int heads)
+        : ln_1_weight({channels}), ln_1_bias({channels}), attn(channels, heads),
+          ln_2_weight({channels}), ln_2_bias({channels}), mlp(channels) {
         ln_1_weight.fill(1.0f);
-        ln_1_bias = Tensor({n_embd});
-        ln_1_bias.fill(0.0f);
-        
-        ln_2_weight = Tensor({n_embd});
         ln_2_weight.fill(1.0f);
-        ln_2_bias = Tensor({n_embd});
-        ln_2_bias.fill(0.0f);
     }
-    
-    // Forward pass
-    Tensor forward(const Tensor& x) {
-        // x: [B, T, C]
-        
-        // Self-attention with residual connection
-        Tensor ln_1 = ops::layer_norm(x);
-        // Apply LayerNorm affine transformation
-        Tensor ln_1_affine = ops::mul_scalar(ln_1_weight, 0.0f); // placeholder - we need to do per-element
-        // Actually: y = weight * x + bias
-        Tensor ln_1_affine_temp({ln_1.dims});
-        for (size_t i = 0; i < ln_1.data.size(); i++) {
-            ln_1_affine_temp.data[i] = ln_1_weight.data[i % ln_1_weight.dims[0]] * ln_1.data[i] + ln_1_bias.data[i % ln_1_bias.dims[0]];
-        }
-        Tensor attn_out = attn.forward(ln_1_affine_temp);
-        Tensor attn_residual = ops::add(x, attn_out); // [B, T, C]
-        
-        // MLP with residual connection
-        Tensor ln_2 = ops::layer_norm(attn_residual);
-        Tensor ln_2_affine_temp({ln_2.dims});
-        for (size_t i = 0; i < ln_2.data.size(); i++) {
-            ln_2_affine_temp.data[i] = ln_2_weight.data[i % ln_2_weight.dims[0]] * ln_2.data[i] + ln_2_bias.data[i % ln_2_bias.dims[0]];
-        }
-        Tensor mlp_out = mlp.forward(ln_2_affine_temp);
-        Tensor out = ops::add(attn_residual, mlp_out); // [B, T, C]
-        
-        return out;
+
+    Tensor forward(const Tensor& input, int64_t batch, int64_t time, Cache* cache) const {
+        Tensor normalized = ops::affine_layer_norm(input, ln_1_weight, ln_1_bias,
+                                                   cache ? &cache->ln_1 : nullptr);
+        Tensor residual = ops::add(input, attn.forward(normalized, batch, time,
+                                                       cache ? &cache->attention : nullptr));
+        normalized = ops::affine_layer_norm(residual, ln_2_weight, ln_2_bias,
+                                            cache ? &cache->ln_2 : nullptr);
+        return ops::add(residual, mlp.forward(normalized, cache ? &cache->mlp : nullptr));
+    }
+
+    Tensor backward(const Cache& cache, const Tensor& upstream, Gradients& gradients) const {
+        Tensor delta = mlp.backward(cache.mlp, upstream, gradients);
+        Tensor residual = ops::add(upstream, ops::layer_norm_backward(cache.ln_2, ln_2_weight, ln_2_bias,
+                                                                     delta, gradients));
+        delta = attn.backward(cache.attention, residual, gradients);
+        return ops::add(residual, ops::layer_norm_backward(cache.ln_1, ln_1_weight, ln_1_bias,
+                                                            delta, gradients));
     }
 };
 
-// GPT model
 class GPT {
 public:
     GPTConfig config;
-    Tensor wte_weight;   // [vocab_size, n_embd]
-    Tensor wpe_weight;   // [block_size, n_embd]
+    Tensor wte_weight, wpe_weight;
     std::vector<Block> blocks;
-    Tensor ln_f_weight;  // [n_embd]
-    Tensor ln_f_bias;    // [n_embd]
-    
+    Tensor ln_f_weight, ln_f_bias;
+
     GPT(GPTConfig config) : config(config) {
-        // Token embedding
         wte_weight = Tensor({config.vocab_size, config.n_embd});
-        wte_weight.randn(0.0f, 0.02f);
-        
-        // Position embedding
+        wte_weight.randn();
         wpe_weight = Tensor({config.block_size, config.n_embd});
-        wpe_weight.randn(0.0f, 0.02f);
-        
-        // Transformer blocks
-        for (int i = 0; i < config.n_layer; i++) {
-            blocks.emplace_back(Block(config.n_embd, config.n_head));
+        wpe_weight.randn();
+        blocks.reserve(config.n_layer);
+        for (int i = 0; i < config.n_layer; ++i) {
+            blocks.emplace_back(config.n_embd, config.n_head);
         }
-        
-        // Final LayerNorm
         ln_f_weight = Tensor({config.n_embd});
         ln_f_weight.fill(1.0f);
         ln_f_bias = Tensor({config.n_embd});
-        ln_f_bias.fill(0.0f);
     }
-    
-    // Forward pass
-    // Returns logits and optionally loss if targets provided
-    std::pair<Tensor, float> forward(const Tensor& idx, const Tensor* targets = nullptr) {
-        // idx: [B, T] (token indices)
-        int64_t B = idx.dims[0];
-        int64_t T = idx.dims[1];
-        assert(T <= config.block_size);
-        
-        // Token embeddings: [B, T, n_embd]
-        Tensor tok_emb = ops::embedding(wte_weight, idx);
-        // tok_emb is already [B, T, n_embd] because embedding preserves the shape of idx and appends n_embd
-        
-        // Position embeddings: [B, T, n_embd]
-        Tensor pos_indices({B, T});
-        for (int64_t b = 0; b < B; b++) {
-            for (int64_t t = 0; t < T; t++) {
-                pos_indices.data[b * T + t] = static_cast<float>(t);
-            }
-        }
-        Tensor pos_emb = ops::embedding(wpe_weight, pos_indices); // [B, T, n_embd]
-        
-        // Embedding sum
-        Tensor x = ops::add(tok_emb, pos_emb); // [B, T, n_embd]
-        
-        // Transformer blocks
-        for (Block& block : blocks) {
-            x = block.forward(x);
-        }
-        
-        // Final LayerNorm
-        Tensor ln_f = ops::layer_norm(x);
-        Tensor ln_f_affine_temp({ln_f.dims});
-        for (size_t i = 0; i < ln_f.data.size(); i++) {
-            ln_f_affine_temp.data[i] = ln_f_weight.data[i % ln_f_weight.dims[0]] * ln_f.data[i] + ln_f_bias.data[i % ln_f_bias.dims[0]];
-        }
-        
-        // Language model head: [B*T, n_embd] * [n_embd, vocab_size] -> [B*T, vocab_size]
-        // Note: weight tying - we use wte_weight transposed as the output projection weight
-        Tensor lm_head_input = ln_f_affine_temp;
-        lm_head_input.reshape({B * T, config.n_embd});
-        
-        // Transpose wte_weight: [vocab_size, n_embd] -> [n_embd, vocab_size]
-        Tensor wte_T = transpose2d(wte_weight); // [n_embd, vocab_size]
-        Tensor logits = ops::matmul(lm_head_input, wte_T); // [B*T, vocab_size]
-        
-        // Calculate loss if targets provided
+
+    std::pair<Tensor, float> forward(const Tensor& idx, const Tensor* targets = nullptr) const {
+        validate_input(idx, targets);
+        Tensor logits = forward_logits(idx, nullptr);
         float loss = 0.0f;
-        if (targets != nullptr) {
-            // Targets: [B, T] -> flatten to [B*T]
-            Tensor targets_flat({B * T});
-            for (int64_t i = 0; i < B * T; i++) {
-                targets_flat.data[i] = targets->data[i];
-            }
-            loss = ops::cross_entropy_loss(logits, targets_flat);
+        if (targets) {
+            Tensor flat_targets = *targets;
+            flat_targets.reshape({flat_targets.size()});
+            loss = ops::cross_entropy_loss(logits, flat_targets);
         }
-        
-        // Reshape logits back to [B, T, vocab_size] if needed for generation
-        Tensor logits_3d({B, T, config.vocab_size});
-        for (int64_t i = 0; i < B * T; i++) {
-            for (int64_t j = 0; j < config.vocab_size; j++) {
-                logits_3d.data[i * config.vocab_size + j] = logits.data[i * config.vocab_size + j];
-            }
-        }
-        
-        return {logits_3d, loss};
+        logits.reshape({idx.dims[0], idx.dims[1], config.vocab_size});
+        return {std::move(logits), loss};
     }
-    
-    // Helper: transpose 2D tensor
-    static Tensor transpose2d(const Tensor& t) {
-        assert(t.dims.size() == 2);
-        Tensor result({t.dims[1], t.dims[0]});
-        for (int64_t i = 0; i < t.dims[0]; i++) {
-            for (int64_t j = 0; j < t.dims[1]; j++) {
-                result.data[j * t.dims[0] + i] = t.data[i * t.dims[1] + j];
+
+    float loss_and_gradients(const Tensor& idx, const Tensor& targets, Gradients& gradients) const {
+        validate_input(idx, &targets);
+        gradients.clear();
+        Cache cache;
+        Tensor logits = forward_logits(idx, &cache);
+        Tensor flat_targets = targets;
+        flat_targets.reshape({flat_targets.size()});
+        const float loss = ops::cross_entropy_loss(logits, flat_targets);
+        Tensor delta = ops::softmax(logits);
+        const auto rows = logits.dims[0], time = idx.dims[1];
+        for (int64_t row = 0; row < rows; ++row) {
+            const auto target = static_cast<int64_t>(targets.data[row]);
+            delta.data[row * config.vocab_size + target] -= 1.0f;
+        }
+        for (float& value : delta.data) value /= static_cast<float>(rows);
+
+        Tensor& token_gradient = gradient_for(gradients, wte_weight);
+        token_gradient = ops::matmul(ops::transpose2d(delta), cache.head_input);
+        delta = ops::matmul(delta, wte_weight);
+        delta = ops::layer_norm_backward(cache.final_norm, ln_f_weight, ln_f_bias, delta, gradients);
+        for (size_t i = blocks.size(); i > 0; --i) {
+            delta = blocks[i - 1].backward(cache.blocks[i - 1], delta, gradients);
+        }
+
+        // The token embedding receives gradients from both lookup and the tied output head.
+        Tensor& position_gradient = gradient_for(gradients, wpe_weight);
+        const int64_t channels = config.n_embd;
+        for (int64_t row = 0; row < rows; ++row) {
+            const auto token = static_cast<int64_t>(idx.data[row]);
+            for (int64_t c = 0; c < channels; ++c) {
+                const float value = delta.data[row * channels + c];
+                token_gradient.data[token * channels + c] += value;
+                position_gradient.data[(row % time) * channels + c] += value;
             }
         }
-        return result;
+        return loss;
+    }
+
+private:
+    struct Cache {
+        std::vector<Block::Cache> blocks;
+        ops::LayerNormCache final_norm;
+        Tensor head_input;
+    };
+
+    void validate_input(const Tensor& idx, const Tensor* targets) const {
+        if (idx.dims.size() != 2 || idx.dims[0] < 1 || idx.dims[1] < 1 ||
+            idx.dims[1] > config.block_size || (targets && targets->dims != idx.dims)) {
+            throw std::invalid_argument("Expected [batch, time] tokens with time within the context window");
+        }
+    }
+
+    Tensor forward_logits(const Tensor& idx, Cache* cache) const {
+        const auto batch = idx.dims[0], time = idx.dims[1];
+        Tensor hidden = ops::embedding(wte_weight, idx);
+        hidden.reshape({batch * time, config.n_embd});
+        for (int64_t row = 0; row < batch * time; ++row) {
+            const auto pos = row % time;
+            for (int c = 0; c < config.n_embd; ++c) {
+                hidden.data[row * config.n_embd + c] += wpe_weight.data[pos * config.n_embd + c];
+            }
+        }
+        if (cache) cache->blocks.resize(blocks.size());
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            hidden = blocks[i].forward(hidden, batch, time, cache ? &cache->blocks[i] : nullptr);
+        }
+        Tensor head_input = ops::affine_layer_norm(hidden, ln_f_weight, ln_f_bias,
+                                                    cache ? &cache->final_norm : nullptr);
+        Tensor logits = ops::matmul(head_input, ops::transpose2d(wte_weight));
+        if (cache) cache->head_input = std::move(head_input);
+        return logits;
     }
 };
 
@@ -799,23 +804,23 @@ public:
         : learning_rate(lr), beta1(b1), beta2(b2), eps(epsilon), weight_decay(wd), t(0) {}
     
     // Initialize moment and variance tensors for parameters
-    void init(const std::vector<Tensor>& params) {
+    void init(const std::vector<Tensor*>& params) {
         m.clear();
         v.clear();
-        for (const Tensor& param : params) {
-            m.push_back(Tensor(param.dims));
+        for (const Tensor* param : params) {
+            m.push_back(Tensor(param->dims));
             m.back().fill(0.0f);
-            v.push_back(Tensor(param.dims));
+            v.push_back(Tensor(param->dims));
             v.back().fill(0.0f);
         }
     }
     
     // Update parameters
-    void step(std::vector<Tensor>& params, const std::vector<Tensor>& grads) {
+    void step(const std::vector<Tensor*>& params, const Gradients& grads) {
         t++;
         for (size_t i = 0; i < params.size(); i++) {
-            Tensor& param = params[i];
-            const Tensor& grad = grads[i];
+            Tensor& param = *params[i];
+            const Tensor& grad = grads.at(params[i]);
             Tensor& mt = m[i];
             Tensor& vt = v[i];
             

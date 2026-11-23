@@ -112,8 +112,8 @@ std::string generate(
         int start_idx = std::max(0, static_cast<int>(gen_tokens.size()) - block_size);
         int context_len = gen_tokens.size() - start_idx;
         
-        // Create input tensor [context_len] (1D for embedding)
-        Tensor idx({static_cast<int64_t>(context_len)});
+        // The model expects a batch dimension, even for a single prompt.
+        Tensor idx({1, static_cast<int64_t>(context_len)});
         for (int i = 0; i < context_len; i++) {
             idx.data[i] = static_cast<float>(gen_tokens[start_idx + i]);
         }
@@ -369,6 +369,12 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    if (max_steps < 0 || batch_size < 1 || block_size < 1 || n_layer < 0 ||
+        n_head < 1 || n_embd < 1 || n_embd % n_head != 0) {
+        std::cerr << "Invalid training dimensions" << std::endl;
+        return 1;
+    }
+
     // Set random seed
     std::srand(seed);
     
@@ -376,6 +382,11 @@ int main(int argc, char* argv[]) {
     auto [tokens, stoi, itos, vocab_size] = utils::load_data(data_path);
     std::cout << "Dataset: " << tokens.size() << " tokens, vocab size: " << vocab_size << std::endl;
     
+    if (tokens.size() <= static_cast<size_t>(block_size)) {
+        std::cerr << "Training data needs at least block_size + 1 bytes" << std::endl;
+        return 1;
+    }
+
     // Create model configuration
     GPTConfig config;
     config.vocab_size = vocab_size;
@@ -402,31 +413,32 @@ int main(int argc, char* argv[]) {
     AdamW optimizer(learning_rate);
     
     // Initialize optimizer with model parameters
-    std::vector<Tensor> params;
+    std::vector<Tensor*> params;
     // Collect all model parameters
-    params.push_back(model.wte_weight);
-    params.push_back(model.wpe_weight);
+    params.push_back(&model.wte_weight);
+    params.push_back(&model.wpe_weight);
     for (Block& block : model.blocks) {
-        params.push_back(block.ln_1_weight);
-        params.push_back(block.ln_1_bias);
-        params.push_back(block.attn.c_attn_weight);
-        params.push_back(block.attn.c_attn_bias);
-        params.push_back(block.attn.c_proj_weight);
-        params.push_back(block.attn.c_proj_bias);
-        params.push_back(block.ln_2_weight);
-        params.push_back(block.ln_2_bias);
-        params.push_back(block.mlp.c_fc_weight);
-        params.push_back(block.mlp.c_fc_bias);
-        params.push_back(block.mlp.c_proj_weight);
-        params.push_back(block.mlp.c_proj_bias);
+        params.push_back(&block.ln_1_weight);
+        params.push_back(&block.ln_1_bias);
+        params.push_back(&block.attn.c_attn_weight);
+        params.push_back(&block.attn.c_attn_bias);
+        params.push_back(&block.attn.c_proj_weight);
+        params.push_back(&block.attn.c_proj_bias);
+        params.push_back(&block.ln_2_weight);
+        params.push_back(&block.ln_2_bias);
+        params.push_back(&block.mlp.c_fc_weight);
+        params.push_back(&block.mlp.c_fc_bias);
+        params.push_back(&block.mlp.c_proj_weight);
+        params.push_back(&block.mlp.c_proj_bias);
     }
-    params.push_back(model.ln_f_weight);
-    params.push_back(model.ln_f_bias);
+    params.push_back(&model.ln_f_weight);
+    params.push_back(&model.ln_f_bias);
     
     optimizer.init(params);
     
     // Training loop
     LossLog loss_log;
+    Gradients grads;
     int token_idx = 0;  // Position in token stream for batch generation
     
     std::cout << "Starting training for " << max_steps << " steps..." << std::endl;
@@ -451,26 +463,8 @@ int main(int argc, char* argv[]) {
             y.data[i] = static_cast<float>(y_flat[i]);
         }
         
-        // Forward pass
-        auto result = model.forward(x, &y);
-        float loss = result.second;
-        
-        // Backward pass would go here - but we haven't implemented autograd
-        // For now, we'll skip the backward pass and just use random gradients
-        // In a real implementation, we would compute gradients via backprop
-        
-        // Dummy gradients for demonstration (in practice, these would come from backprop)
-        std::vector<Tensor> grads;
-        std::default_random_engine generator;
-        std::normal_distribution<float> distribution(0.0f, 0.01f);
-        for (const Tensor& param : params) {
-            Tensor grad(param.dims);
-            for (size_t i = 0; i < param.data.size(); i++) {
-                grad.data[i] = distribution(generator);
-            }
-            grads.push_back(grad);
-        }
-        
+        const float loss = model.loss_and_gradients(x, y, grads);
+
         // Update learning rate
         float lr = get_lr(step, warmup_steps, max_steps, learning_rate, learning_rate * 0.1f);
         optimizer.learning_rate = lr;
@@ -478,16 +472,16 @@ int main(int argc, char* argv[]) {
         // Clip gradients (simplified)
         float max_norm = 1.0f;
         float total_norm = 0.0f;
-        for (const Tensor& grad : grads) {
-            for (float g : grad.data) {
+        for (const Tensor* param : params) {
+            for (float g : grads.at(param).data) {
                 total_norm += g * g;
             }
         }
         total_norm = std::sqrt(total_norm);
         float clip_coef = max_norm / (total_norm + 1e-6f);
         if (clip_coef < 1.0f) {
-            for (Tensor& grad : grads) {
-                for (float& g : grad.data) {
+            for (const Tensor* param : params) {
+                for (float& g : grads.at(param).data) {
                     g *= clip_coef;
                 }
             }
@@ -498,13 +492,9 @@ int main(int argc, char* argv[]) {
         
         // Logging
         if (step % 100 == 0) {
-            // Validation (simplified - just use training loss for now)
-            float val_loss = loss;  // In practice, we'd compute on validation set
-            
-            loss_log.add(step, loss, val_loss);
+            loss_log.add(step, loss);
             print_progress(step, max_steps, loss, lr, "Training");
-            std::cout << " | val loss: " << std::fixed << std::setprecision(4) << val_loss;
-            
+
             // Generate sample
             if (step > 0) {
                 // In our simple model, we don't have train/eval modes, so just use it directly
