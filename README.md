@@ -37,6 +37,24 @@ g++ -std=c++17 -O2 -o train train.cpp -I.
 g++ -std=c++17 -O2 -o generate generate.cpp -I.
 ```
 
+### Compute device
+
+Run `make` to build `build/train` and `build/generate`. On macOS this enables Metal and Accelerate. On Linux it builds the portable CPU implementation. The single-file build commands above also build the portable CPU implementation.
+
+```bash
+make
+./build/train --device auto --data data/shakespeare.txt
+./build/generate --device cpu --checkpoint checkpoint_final.bin --prompt "ROMEO: "
+```
+
+- `--device auto` (default) uses Metal for large matrix products on a supported Mac and CPU for smaller products. It selects CPU when a GPU or Metal-enabled build is unavailable.
+- `--device cpu` runs all operations on CPU and skips GPU detection. On macOS, a build with Accelerate enabled uses it for dense matrix products.
+- `--device metal` requests Metal for matrix products of any size. Unsupported products and GPU errors fall back to CPU.
+
+Only matrix multiplication is offloaded. Transferring matrices between the CPU and a discrete GPU can offset compute savings. CPU and Metal builds use the same checkpoint format.
+
+Use `make METAL=0 ACCELERATE=0 BUILD_DIR=build/cpu` for a portable CPU-only build on macOS. To enable parallel CPU attention with OpenMP, pass `OPENMP=1` and use `OMP_NUM_THREADS` to choose the thread count at runtime. Apple Clang builds may need `OPENMP_FLAGS` and `OPENMP_LIBS` pointing to an installed OpenMP runtime. Use a separate `BUILD_DIR` for each build configuration.
+
 ## Usage
 
 ### Training

@@ -347,10 +347,18 @@ int main(int argc, char* argv[]) {
     std::string checkpoint_dir = "./";
     int seed = 42;
     
+    std::string device = "auto";
+
     // Parse command line arguments (simplified)
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc) {
+        if (arg == "--device") {
+            if (i + 1 == argc) {
+                std::cerr << "Missing value for --device" << std::endl;
+                return 1;
+            }
+            device = argv[++i];
+        } else if (arg == "--data" && i + 1 < argc) {
             data_path = argv[++i];
         } else if (arg == "--max_steps" && i + 1 < argc) {
             max_steps = std::stoi(argv[++i]);
@@ -369,6 +377,8 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    if (!matrix_backend::configure(device)) return 1;
+
     if (max_steps < 0 || batch_size < 1 || block_size < 1 || n_layer < 0 ||
         n_head < 1 || n_embd < 1 || n_embd % n_head != 0) {
         std::cerr << "Invalid training dimensions" << std::endl;

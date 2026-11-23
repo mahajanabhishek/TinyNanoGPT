@@ -199,10 +199,18 @@ int main(int argc, char* argv[]) {
     int top_k = 40;
     int seed = -1;  // -1 means random seed
 
+    std::string device = "auto";
+
     // Parse command line arguments (simplified)
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--checkpoint" && i + 1 < argc) {
+        if (arg == "--device") {
+            if (i + 1 == argc) {
+                std::cerr << "Missing value for --device" << std::endl;
+                return 1;
+            }
+            device = argv[++i];
+        } else if (arg == "--checkpoint" && i + 1 < argc) {
             checkpoint_path = argv[++i];
         } else if (arg == "--prompt" && i + 1 < argc) {
             prompt = argv[++i];
@@ -216,6 +224,8 @@ int main(int argc, char* argv[]) {
             seed = std::stoi(argv[++i]);
         }
     }
+
+    if (!matrix_backend::configure(device)) return 1;
 
     // Set seed if provided
     if (seed != -1) {

@@ -1,6 +1,7 @@
 #ifndef MODEL_H
 #define MODEL_H
 
+#include "matrix_backend.h"
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -213,6 +214,12 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     
     Tensor c({M, N});
     if (M == 0 || N == 0 || K == 0) return c;
+
+#if defined(TINYNANOGPT_USE_METAL) && defined(__APPLE__)
+    if (matrix_backend::try_metal_matmul(a.data.data(), b.data.data(), c.data.data(), M, N, K)) {
+        return c;
+    }
+#endif
 
 #if defined(TINYNANOGPT_USE_ACCELERATE) && defined(__APPLE__)
     constexpr auto max_dimension = std::numeric_limits<int>::max();
