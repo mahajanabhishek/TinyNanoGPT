@@ -44,3 +44,13 @@ $(BUILD_DIR)/%: %.cpp model.h matrix_backend.h $(BACKEND_SOURCES) Makefile | $(B
 
 $(BUILD_DIR):
 	mkdir -p $@
+
+ifeq ($(HOST_OS),Darwin)
+.PHONY: metal-benchmark
+metal-benchmark: $(BUILD_DIR)/metal-train-bench
+
+$(BUILD_DIR)/metal-train-bench: benchmarks/metal_train_bench.mm model.h matrix_backend.h Makefile | $(BUILD_DIR)
+	$(CXX) -std=c++17 $(CPPFLAGS) $(CXXFLAGS) -fobjc-arc -I. $< $(LDFLAGS) \
+	  -framework Foundation -framework Metal -framework MetalPerformanceShaders \
+	  -framework MetalPerformanceShadersGraph $(LDLIBS) -o $@
+endif
