@@ -123,8 +123,13 @@ int main(int argc, char** argv) {
                 auto variance = times(reduce(times(centered, centered), @[@2]), scalar(1.0f / channels));
                 return plus(times(divide(centered, sqrt(plus(variance, scalar(1e-5f)))), param(weight)), param(bias));
             };
+            auto dense_product = [&](GraphTensor x, GraphTensor weight, int64_t inputs, int64_t outputs) {
+                auto flat = reshape(x, @[@(batch * time_steps), @(inputs)]);
+                auto product = matmul(flat, weight);
+                return reshape(product, @[@(batch), @(time_steps), @(outputs)]);
+            };
             auto dense = [&](GraphTensor x, const Tensor& weight, const Tensor& bias) {
-                return plus(matmul(x, param(weight)), param(bias));
+                return plus(dense_product(x, param(weight), weight.dims[0], weight.dims[1]), param(bias));
             };
 
             auto input_shape = @[@(batch), @(time_steps)];
@@ -169,7 +174,8 @@ int main(int argc, char** argv) {
                                   plus(scalar(1.0f), [graph erfWithTensor:times(fc, scalar(0.7071067812f)) name:nil]));
                 hidden = plus(hidden, dense(gelu, block.mlp.c_proj_weight, block.mlp.c_proj_bias));
             }
-            auto logits = matmul(norm(hidden, model.ln_f_weight, model.ln_f_bias), swap(wte, 0, 1));
+            auto logits = dense_product(norm(hidden, model.ln_f_weight, model.ln_f_bias),
+                                        swap(wte, 0, 1), channels, vocabulary);
             auto loss = [graph softMaxCrossEntropyWithSourceTensor:logits labelsTensor:onehot axis:2
                                                     reductionType:MPSGraphLossReductionTypeMean name:nil];
 
