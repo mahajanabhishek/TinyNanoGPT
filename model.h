@@ -16,6 +16,10 @@
 #include <limits>
 #include <utility>
 
+#if defined(TINYNANOGPT_USE_ACCELERATE) && defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 // Simple tensor class for float data
 class Tensor {
 public:
@@ -120,18 +124,6 @@ namespace ops {
 
 // Element-wise addition: c = a + b
 Tensor add(const Tensor& a, const Tensor& b) {
-    std::cerr << "add: a.dims = [";
-    for (size_t i = 0; i < a.dims.size(); ++i) {
-        std::cerr << a.dims[i];
-        if (i + 1 < a.dims.size()) std::cerr << ", ";
-    }
-    std::cerr << "], b.dims = [";
-    for (size_t i = 0; i < b.dims.size(); ++i) {
-        std::cerr << b.dims[i];
-        if (i + 1 < b.dims.size()) std::cerr << ", ";
-    }
-    std::cerr << "]" << std::endl;
-    
     // Handle broadcasting for 2D + 1D and 1D + 2D
     if (a.dims.size() == 2 && b.dims.size() == 1 && a.dims[1] == b.dims[0]) {
         // broadcast b to [a.dims[0], a.dims[1]]
@@ -220,13 +212,31 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     assert(b.dims[0] == K);
     
     Tensor c({M, N});
-    for (int64_t i = 0; i < M; i++) {
-        for (int64_t j = 0; j < N; j++) {
-            float sum = 0.0f;
-            for (int64_t k = 0; k < K; k++) {
-                sum += a.data[i * K + k] * b.data[k * N + j];
+    if (M == 0 || N == 0 || K == 0) return c;
+
+#if defined(TINYNANOGPT_USE_ACCELERATE) && defined(__APPLE__)
+    constexpr auto max_dimension = std::numeric_limits<int>::max();
+    if (M <= max_dimension && N <= max_dimension && K <= max_dimension) {
+        const int rows = static_cast<int>(M);
+        const int columns = static_cast<int>(N);
+        const int inner = static_cast<int>(K);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, rows, columns, inner,
+                    1.0f, a.data.data(), inner, b.data.data(), columns,
+                    0.0f, c.data.data(), columns);
+        return c;
+    }
+#endif
+
+    // Walk rows of B and C contiguously so the compiler can vectorize the inner loop.
+    for (int64_t i = 0; i < M; ++i) {
+        const float* left = a.data.data() + i * K;
+        float* result = c.data.data() + i * N;
+        for (int64_t k = 0; k < K; ++k) {
+            const float scale = left[k];
+            const float* right = b.data.data() + k * N;
+            for (int64_t j = 0; j < N; ++j) {
+                result[j] += scale * right[j];
             }
-            c.data[i * N + j] = sum;
         }
     }
     return c;
@@ -514,6 +524,10 @@ public:
         if (cache) probabilities = Tensor({batch, n_head, time, time});
         std::vector<float> row(time);
 
+        // Each batch/head pair owns its output and gradient entries.
+#if defined(_OPENMP)
+        #pragma omp parallel for collapse(2) schedule(static) firstprivate(row) if(batch > 1 && time >= 32)
+#endif
         for (int64_t b = 0; b < batch; ++b) {
             for (int64_t h = 0; h < n_head; ++h) {
                 const auto head = h * head_size;
@@ -562,6 +576,10 @@ public:
         Tensor qkv_gradient(cache.qkv.dims);
         std::vector<float> value_dots(time);
 
+        // Each batch/head pair owns its output and gradient entries.
+#if defined(_OPENMP)
+        #pragma omp parallel for collapse(2) schedule(static) firstprivate(value_dots) if(batch > 1 && time >= 32)
+#endif
         for (int64_t b = 0; b < batch; ++b) {
             for (int64_t h = 0; h < n_head; ++h) {
                 const auto head = h * head_size;
@@ -817,31 +835,24 @@ public:
     
     // Update parameters
     void step(const std::vector<Tensor*>& params, const Gradients& grads) {
-        t++;
+        ++t;
+        const double first_correction = 1 - std::pow(beta1, t);
+        const double second_correction = 1 - std::pow(beta2, t);
         for (size_t i = 0; i < params.size(); i++) {
             Tensor& param = *params[i];
             const Tensor& grad = grads.at(params[i]);
             Tensor& mt = m[i];
             Tensor& vt = v[i];
-            
-            // Update biased first moment estimate
+
             for (size_t j = 0; j < param.data.size(); j++) {
-                mt.data[j] = beta1 * mt.data[j] + (1 - beta1) * grad.data[j];
-                vt.data[j] = beta2 * vt.data[j] + (1 - beta2) * grad.data[j] * grad.data[j];
-            }
-            
-            // Compute bias-corrected first moment estimate
-            Tensor mt_hat(mt.dims);
-            Tensor vt_hat(vt.dims);
-            for (size_t j = 0; j < param.data.size(); j++) {
-                mt_hat.data[j] = mt.data[j] / (1 - std::pow(beta1, t));
-                vt_hat.data[j] = vt.data[j] / (1 - std::pow(beta2, t));
-            }
-            
-            // Update parameters
-            for (size_t j = 0; j < param.data.size(); j++) {
-                float denom = std::sqrt(vt_hat.data[j]) + eps;
-                float update = learning_rate * (mt_hat.data[j] / denom + weight_decay * param.data[j]);
+                const float g = grad.data[j];
+                mt.data[j] = beta1 * mt.data[j] + (1 - beta1) * g;
+                vt.data[j] = beta2 * vt.data[j] + (1 - beta2) * g * g;
+
+                const float corrected_m = mt.data[j] / first_correction;
+                const float corrected_v = vt.data[j] / second_correction;
+                const float denom = std::sqrt(corrected_v) + eps;
+                const float update = learning_rate * (corrected_m / denom + weight_decay * param.data[j]);
                 param.data[j] -= update;
             }
         }
